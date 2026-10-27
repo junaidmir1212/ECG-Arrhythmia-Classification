@@ -131,9 +131,16 @@ def main():
     available_indices = np.where(y_test == selected_class_label)[0]
     st.sidebar.info(f"Available samples in DS2 for this class: **{len(available_indices)}**")
     
-    if len(available_indices) == 0:
-        st.warning("No samples found for this category.")
-        return
+    # Ensure slider is only rendered if more than 1 sample is available
+    if len(available_indices) > 1:
+        sample_sub_idx = st.sidebar.slider(
+            "Select Sample Index:", 
+            0, 
+            len(available_indices) - 1, 
+            0
+        )
+    else:
+        sample_sub_idx = 0
         
     sample_sub_idx = st.sidebar.slider("Select Sample Index:", 0, len(available_indices) - 1, 0)
     beat_idx = available_indices[sample_sub_idx]
