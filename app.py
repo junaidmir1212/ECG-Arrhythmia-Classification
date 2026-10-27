@@ -1,12 +1,18 @@
 # app.py
 import os
+import io
+import tempfile
+from datetime import datetime
 import streamlit as st
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from scipy.signal import butter, filtfilt
+from fpdf import FPDF
+
 from model import ECGArrhythmiaClassifier
 from config import CLASS_NAMES
 
@@ -16,7 +22,10 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. Embedded Pan-Tompkins Autonomous QRS Detector ---
+
+# =====================================================================
+# 1. Embedded Pan-Tompkins Autonomous QRS Detector
+# =====================================================================
 class PanTompkinsDetector:
     def __init__(self, fs=360):
         self.fs = fs
@@ -51,7 +60,209 @@ class PanTompkinsDetector:
         return np.array(peaks, dtype=int)
 
 
-# --- 2. Model & Data Caching ---
+# =====================================================================
+# 2. HRV and ST Deviation Clinical Measurement Engines
+# =====================================================================
+def compute_hrv_metrics(r_peaks, fs=360):
+    if len(r_peaks) < 2:
+        return None, None, None
+    
+    rr_intervals_ms = np.diff(r_peaks) / fs * 1000.0
+    rr_times_sec = r_peaks[1:] / fs
+
+    mean_rr = np.mean(rr_intervals_ms)
+    mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 0
+    sdnn = np.std(rr_intervals_ms, ddof=1) if len(rr_intervals_ms) > 1 else 0.0
+    
+    successive_diffs = np.diff(rr_intervals_ms)
+    rmssd = np.sqrt(np.mean(successive_diffs ** 2)) if len(successive_diffs) > 0 else 0.0
+    nn50 = np.sum(np.abs(successive_diffs) > 50)
+    pnn50 = (nn50 / len(successive_diffs) * 100.0) if len(successive_diffs) > 0 else 0.0
+
+    metrics = {
+        "mean_hr": mean_hr,
+        "mean_rr": mean_rr,
+        "sdnn": sdnn,
+        "rmssd": rmssd,
+        "pnn50": pnn50
+    }
+    return metrics, rr_times_sec, rr_intervals_ms
+
+
+def measure_st_deviation(beat_raw, r_idx_local=128, fs=360):
+    pr_start = max(0, r_idx_local - int(0.080 * fs))
+    pr_end = max(0, r_idx_local - int(0.040 * fs))
+    isoelectric_voltage = np.median(beat_raw[pr_start:pr_end]) if pr_end > pr_start else beat_raw[0]
+
+    qrs_search_start = r_idx_local + int(0.025 * fs)
+    qrs_search_end = min(len(beat_raw), r_idx_local + int(0.090 * fs))
+    s_trough = qrs_search_start + np.argmin(beat_raw[qrs_search_start:qrs_search_end])
+    
+    diffs = np.diff(beat_raw)
+    j_idx = s_trough
+    for i in range(s_trough, min(len(diffs), s_trough + int(0.040 * fs))):
+        if abs(diffs[i]) < 0.005:
+            j_idx = i
+            break
+
+    st_sample_idx = min(len(beat_raw) - 1, j_idx + int(0.060 * fs))
+    st_voltage = beat_raw[st_sample_idx]
+    st_deviation_mv = float(st_voltage - isoelectric_voltage)
+
+    if st_deviation_mv >= 0.10:
+        diagnosis = "STEMI Alert (ST-Elevation)"
+        severity = "CRITICAL"
+        color = "#e74c3c"
+    elif st_deviation_mv <= -0.05:
+        diagnosis = "Ischemia Alert (ST-Depression)"
+        severity = "HIGH"
+        color = "#e67e22"
+    else:
+        diagnosis = "Normal ST Contour"
+        severity = "BENIGN"
+        color = "#27ae60"
+
+    return {
+        "st_deviation_mv": st_deviation_mv,
+        "isoelectric_mv": isoelectric_voltage,
+        "j_idx": j_idx,
+        "st_idx": st_sample_idx,
+        "diagnosis": diagnosis,
+        "severity": severity,
+        "color": color
+    }
+
+
+# =====================================================================
+# 3. Clinical PDF Report Generator
+# =====================================================================
+class ClinicalECGReport(FPDF):
+    def header(self):
+        self.set_font("Helvetica", "B", 14)
+        self.set_text_color(26, 82, 118)
+        self.cell(0, 10, "CARDIOVASCULAR AI DIAGNOSTIC AUDIT REPORT", border=False, new_x="LMARGIN", new_y="NEXT", align="C")
+        self.set_font("Helvetica", "I", 9)
+        self.set_text_color(100, 100, 100)
+        self.cell(0, 5, "Automated Continuous Rhythm & Morphological Attribution Audit", border=False, new_x="LMARGIN", new_y="NEXT", align="C")
+        self.line(10, 26, 200, 26)
+        self.ln(6)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Helvetica", "I", 8)
+        self.set_text_color(150, 150, 150)
+        self.cell(0, 10, f"ECG Arrhythmia AI Diagnostic Studio | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Page {self.page_no()}", align="C")
+
+
+def create_clinical_pdf(metrics_dict, anomalies_list, hrv_metrics=None, st_data=None, fig_anomaly=None):
+    pdf = ClinicalECGReport(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    
+    # Study Metadata
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(44, 62, 80)
+    pdf.cell(0, 7, "1. Patient Trace Assessment Summary", new_x="LMARGIN", new_y="NEXT")
+    
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(95, 6, f"Recording Length: {metrics_dict['duration_sec']:.1f} s ({metrics_dict['total_samples']} samples)", border=1)
+    pdf.cell(95, 6, f"Sampling Frequency: {metrics_dict['fs']} Hz", border=1, new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(95, 6, f"Total QRS Detected: {metrics_dict['total_beats']}", border=1)
+    pdf.cell(95, 6, f"Mean Heart Rate: {metrics_dict['mean_hr']:.0f} bpm", border=1, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    # Autonomic Tone & HRV
+    if hrv_metrics is not None:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(44, 62, 80)
+        pdf.cell(0, 7, "2. Autonomic Assessment & HRV Biomarkers", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(240, 243, 244)
+        pdf.cell(50, 6, "Biomarker", border=1, fill=True)
+        pdf.cell(40, 6, "Calculated Value", border=1, fill=True)
+        pdf.cell(100, 6, "Physiological Indication", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_font("Helvetica", "", 9)
+        hrv_rows = [
+            ("Mean R-R Interval", f"{hrv_metrics['mean_rr']:.0f} ms", "Baseline cardiac cycle duration"),
+            ("SDNN", f"{hrv_metrics['sdnn']:.1f} ms", "Global autonomic tone & circadian variability"),
+            ("RMSSD", f"{hrv_metrics['rmssd']:.1f} ms", "Parasympathetic / vagal regulatory modulation"),
+            ("pNN50", f"{hrv_metrics['pnn50']:.1f} %", "Percentage of successive differences > 50 ms")
+        ]
+        for metric_name, val_str, indication in hrv_rows:
+            pdf.cell(50, 6, metric_name, border=1)
+            pdf.cell(40, 6, val_str, border=1)
+            pdf.cell(100, 6, indication, border=1, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    # Ischemia / ST Deviation
+    if st_data is not None:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(44, 62, 80)
+        pdf.cell(0, 7, "3. Ischemic Injury Assessment (ST-Segment Deviation)", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(60, 6, f"Measured ST Shift: {st_data['st_deviation_mv']:+.2f} mV", border=1)
+        pdf.cell(50, 6, f"Status: {st_data['severity']}", border=1)
+        pdf.cell(80, 6, f"Interpretation: {st_data['diagnosis']}", border=1, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    # AAMI EC57 Beat Classification Distribution
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(44, 62, 80)
+    pdf.cell(0, 7, "4. AAMI EC57 Rhythm Triage Counts", new_x="LMARGIN", new_y="NEXT")
+    
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_fill_color(240, 243, 244)
+    pdf.cell(60, 6, "Class Category", border=1, fill=True)
+    pdf.cell(35, 6, "Count", border=1, fill=True)
+    pdf.cell(35, 6, "Prevalence (%)", border=1, fill=True)
+    pdf.cell(60, 6, "Clinical Severity", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 9)
+    classes_info = [
+        ("N (Normal Sinus)", metrics_dict['n_count'], "Baseline Conduction"),
+        ("V (Ventricular Ectopic / PVC)", metrics_dict['v_count'], "High Priority (Malignant Potential)"),
+        ("S (Supraventricular Ectopic)", metrics_dict['s_count'], "Moderate Priority"),
+        ("F / Q (Fusion / Unclassifiable)", metrics_dict['fq_count'], "Artifact / Complex Conduction")
+    ]
+    total_b = max(metrics_dict['total_beats'], 1)
+    for name, cnt, sev in classes_info:
+        pct = (cnt / total_b) * 100
+        pdf.cell(60, 6, name, border=1)
+        pdf.cell(35, 6, str(cnt), border=1)
+        pdf.cell(35, 6, f"{pct:.1f}%", border=1)
+        pdf.cell(60, 6, sev, border=1, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Anomaly Attribution & Grad-CAM Plot
+    if fig_anomaly is not None:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(44, 62, 80)
+        pdf.cell(0, 7, "5. Deep Feature Attribution (1D Grad-CAM Diagnostic Focus)", new_x="LMARGIN", new_y="NEXT")
+        
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(80, 80, 80)
+        pdf.multi_cell(0, 4, "The plot below illustrates salient activations driving the model's classification. Peaks highlighted in inferno colormap isolate aberrant intervals (e.g. widened QRS or ST deviations).")
+        pdf.ln(1)
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmpfile:
+            fig_anomaly.savefig(tmpfile.name, dpi=200, bbox_inches="tight")
+            pdf.image(tmpfile.name, x=15, w=180)
+        pdf.ln(3)
+
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(130, 130, 130)
+    pdf.multi_cell(0, 4, "Notice: This automated report is generated by an edge-optimized neural decision-support model under the AAMI EC57 inter-patient benchmark. It is intended to assist medical professionals by prioritizing anomalies and should not replace primary clinical evaluation by a certified electrophysiologist.")
+
+    return pdf.output()
+
+
+# =====================================================================
+# 4. Model and Benchmark Data Caching
+# =====================================================================
 @st.cache_resource
 def load_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -66,6 +277,7 @@ def load_model():
     model.to(device)
     model.eval()
     return model, device
+
 
 @st.cache_data
 def load_test_data():
@@ -99,7 +311,9 @@ def load_test_data():
     return np.expand_dims(np.array(beats, dtype=np.float32), 1), np.array(labels, dtype=np.int64)
 
 
-# --- 3. 1D Grad-CAM Engine ---
+# =====================================================================
+# 5. 1D Grad-CAM Diagnostic Waveform Attribution Engine
+# =====================================================================
 class GradCAM1D:
     def __init__(self, model, target_layer):
         self.model = model
@@ -133,7 +347,9 @@ class GradCAM1D:
         return cam_up.squeeze().detach().cpu().numpy()
 
 
-# --- 4. Main Application ---
+# =====================================================================
+# 6. Main Streamlit Diagnostic Studio
+# =====================================================================
 def main():
     st.title("🫀 Real-Time ECG Arrhythmia Diagnostics & Interpretability")
     st.markdown(
@@ -155,9 +371,9 @@ def main():
         "📂 Continuous Patient ECG Scanner"
     ])
 
-    # ==========================================
+    # -----------------------------------------------------------------
     # TAB 1: Single Beat Inspector
-    # ==========================================
+    # -----------------------------------------------------------------
     with tab1:
         st.sidebar.header("ECG Sample Selector")
         
@@ -248,9 +464,9 @@ def main():
                     "For ventricular ectopic beats (V), attention typically peaks across the widened QRS complex or inverted T-wave."
                 )
 
-    # ==========================================
-    # TAB 2: Upload Continuous Patient ECG
-    # ==========================================
+    # -----------------------------------------------------------------
+    # TAB 2: Continuous Patient ECG Scanner
+    # -----------------------------------------------------------------
     with tab2:
         st.subheader("Automated Continuous Rhythm Scanner")
         st.markdown(
@@ -321,19 +537,110 @@ def main():
 
                 abnormal_idxs = np.where(batch_preds != 0)[0]
                 
-                if len(abnormal_idxs) > 0:
-                    st.error(f"🚨 Triage Alert: **{len(abnormal_idxs)}** anomalous beat(s) flagged for review.")
-                    
-                    selected_abnormal = st.selectbox(
-                        "Jump directly to anomalous beat:",
-                        options=abnormal_idxs,
-                        format_func=lambda idx: f"Beat #{idx} at {(valid_peaks[idx]/fs):.2f}s | Predicted: {CLASS_NAMES[batch_preds[idx]]} ({batch_probs[idx][batch_preds[idx]]*100:.1f}% confidence)"
-                    )
-                    inspect_idx = selected_abnormal
-                else:
-                    st.success("✅ Rhythm Analysis: Entire trace verified as normal sinus rhythm.")
-                    inspect_idx = 0
+                # --- Continuous Rhythm Timeline with Click Selection ---
+                st.write("---")
+                st.subheader("📈 Continuous Rhythm Timeline (Click Any Peak to Inspect)")
+                
+                time_strip_sec = np.arange(len(filtered_signal)) / fs
+                peak_times_sec = np.array(valid_peaks) / fs
+                peak_voltages = filtered_signal[valid_peaks]
 
+                color_map = {0: "#2ecc71", 1: "#f39c12", 2: "#e74c3c", 3: "#9b59b6", 4: "#95a5a6"}
+                marker_colors = [color_map.get(p, "#34495e") for p in batch_preds]
+                marker_labels = [f"Beat #{i}: {CLASS_NAMES[p]} ({batch_probs[i][p]*100:.1f}%)" 
+                                 for i, p in enumerate(batch_preds)]
+
+                fig_timeline = go.Figure()
+                fig_timeline.add_trace(go.Scatter(
+                    x=time_strip_sec,
+                    y=filtered_signal,
+                    mode='lines',
+                    line=dict(color='#7f8c8d', width=1),
+                    name='ECG Lead MLII',
+                    hoverinfo='skip'
+                ))
+                fig_timeline.add_trace(go.Scatter(
+                    x=peak_times_sec,
+                    y=peak_voltages,
+                    mode='markers',
+                    marker=dict(size=10, color=marker_colors, symbol='circle'),
+                    text=marker_labels,
+                    hoverinfo='text',
+                    name='R-Peaks',
+                    customdata=np.arange(len(valid_peaks))
+                ))
+                fig_timeline.update_layout(
+                    height=250,
+                    margin=dict(l=20, r=20, t=10, b=20),
+                    xaxis=dict(title="Time (seconds)", showgrid=True),
+                    yaxis=dict(title="Voltage (mV)", showgrid=True),
+                    showlegend=False,
+                    clickmode='event+select'
+                )
+
+                timeline_event = st.plotly_chart(
+                    fig_timeline, 
+                    use_container_width=True, 
+                    on_select="rerun", 
+                    selection_mode="points"
+                )
+
+                selected_beat_idx = 0
+                if timeline_event and "points" in timeline_event.get("selection", {}) and len(timeline_event["selection"]["points"]) > 0:
+                    clicked_point = timeline_event["selection"]["points"][0]
+                    if clicked_point.get("curve_number") == 1:
+                        selected_beat_idx = int(clicked_point["point_index"])
+                elif len(abnormal_idxs) > 0:
+                    selected_beat_idx = int(abnormal_idxs[0])
+
+                inspect_idx = st.selectbox(
+                    "Selected Heartbeat for Deep Diagnostic Audit:",
+                    options=list(range(len(valid_beats))),
+                    index=selected_beat_idx,
+                    format_func=lambda idx: f"Beat #{idx} at {(valid_peaks[idx]/fs):.2f}s | Predicted: {CLASS_NAMES[batch_preds[idx]]} ({batch_probs[idx][batch_preds[idx]]*100:.1f}%)"
+                )
+
+                # --- Heart Rate Variability (HRV) & R-R Tachogram ---
+                hrv_metrics, rr_times, rr_ms = compute_hrv_metrics(valid_peaks, fs=fs)
+
+                if hrv_metrics is not None:
+                    st.write("---")
+                    st.subheader("🫀 Autonomic Assessment: Heart Rate Variability (HRV)")
+                    
+                    h1, h2, h3, h4 = st.columns(4)
+                    h1.metric("Mean R-R Interval", f"{hrv_metrics['mean_rr']:.0f} ms")
+                    h2.metric("SDNN (Global Variability)", f"{hrv_metrics['sdnn']:.1f} ms")
+                    h3.metric("RMSSD (Parasympathetic)", f"{hrv_metrics['rmssd']:.1f} ms")
+                    h4.metric("pNN50", f"{hrv_metrics['pnn50']:.1f} %")
+
+                    fig_tachogram = go.Figure()
+                    fig_tachogram.add_trace(go.Scatter(
+                        x=rr_times,
+                        y=rr_ms,
+                        mode='lines+markers',
+                        line=dict(color='#2980b9', width=1.5),
+                        marker=dict(size=5, color='#e74c3c'),
+                        name='R-R Interval',
+                        hovertemplate='Time: %{x:.2f}s<br>R-R: %{y:.0f} ms<extra></extra>'
+                    ))
+                    fig_tachogram.add_hline(
+                        y=hrv_metrics['mean_rr'], 
+                        line_dash="dash", 
+                        line_color="#27ae60",
+                        annotation_text=f"Mean R-R: {hrv_metrics['mean_rr']:.0f} ms",
+                        annotation_position="bottom right"
+                    )
+                    fig_tachogram.update_layout(
+                        title="R-R Interval Tachogram (Beat-to-Beat Progression)",
+                        height=220,
+                        margin=dict(l=20, r=20, t=35, b=20),
+                        xaxis=dict(title="Time along Recording (s)", showgrid=True),
+                        yaxis=dict(title="R-R Interval (ms)", showgrid=True),
+                        showlegend=False
+                    )
+                    st.plotly_chart(fig_tachogram, use_container_width=True)
+
+                # --- 1D Grad-CAM on Inspected Beat ---
                 st.write("---")
                 st.subheader(f"Detailed Waveform & Attribution: Beat #{inspect_idx}")
                 
@@ -362,8 +669,76 @@ def main():
                 plt.tight_layout()
                 st.pyplot(fig)
                 plt.close(fig)
+
+                # --- ST-Segment Morphology & Ischemia Assessment ---
+                raw_beat_unnorm = filtered_signal[valid_peaks[inspect_idx] - 128 : valid_peaks[inspect_idx] + 128]
+                st_data = measure_st_deviation(raw_beat_unnorm, r_idx_local=128, fs=fs)
+
+                st.write("---")
+                st.subheader("🩺 Myocardial Ischemia & Infarction Audit (ST Deviation)")
+
+                col_st1, col_st2, col_st3 = st.columns(3)
+                col_st1.metric(
+                    "ST Deviation (J+60ms)",
+                    f"{st_data['st_deviation_mv']:+.2f} mV",
+                    delta=f"{st_data['st_deviation_mv'] * 10:+.1f} mm deflection",
+                    delta_color="inverse" if abs(st_data['st_deviation_mv']) >= 0.05 else "off"
+                )
+                col_st2.metric("Isoelectric Baseline", f"{st_data['isoelectric_mv']:.2f} mV")
+                col_st3.markdown(
+                    f"**Pathology Assessment:**  \n<span style='color:{st_data['color']}; font-weight:bold; font-size:18px;'>{st_data['diagnosis']}</span>", 
+                    unsafe_allow_html=True
+                )
+
+                fig_st, ax_st = plt.subplots(figsize=(10, 2.5))
+                t_samples = np.arange(len(raw_beat_unnorm))
+                ax_st.plot(t_samples, raw_beat_unnorm, color='#2c3e50', lw=1.5, label='Filtered ECG (mV)')
+                ax_st.axhline(st_data['isoelectric_mv'], color='gray', linestyle='--', lw=1, label='Isoelectric (PR)')
+                ax_st.scatter(st_data['j_idx'], raw_beat_unnorm[st_data['j_idx']], color='#3498db', s=40, zorder=5, label='J-Point')
+                ax_st.scatter(st_data['st_idx'], raw_beat_unnorm[st_data['st_idx']], color=st_data['color'], s=60, zorder=5, label=f"J+60ms ({st_data['st_deviation_mv']:+.2f} mV)")
+                ax_st.set_ylabel("Voltage (mV)")
+                ax_st.set_xlabel("Sample Point (Relative to R-Peak at 128)")
+                ax_st.grid(True, linestyle=':', alpha=0.5)
+                ax_st.legend(loc='upper right', fontsize=8)
+                plt.tight_layout()
+                st.pyplot(fig_st)
+                plt.close(fig_st)
+
+                # --- PDF Generation Action ---
+                st.write("---")
+                st.subheader("📄 Clinical Decision-Support Export")
+
+                mean_hr_val = (len(valid_peaks) / (duration_sec / 60.0)) if duration_sec > 0 else 0
+                metrics_payload = {
+                    "duration_sec": duration_sec,
+                    "total_samples": len(raw_signal),
+                    "fs": fs,
+                    "total_beats": len(valid_beats),
+                    "mean_hr": mean_hr_val,
+                    "n_count": int(np.sum(batch_preds == 0)),
+                    "v_count": int(np.sum(batch_preds == 2)),
+                    "s_count": int(np.sum(batch_preds == 1)),
+                    "fq_count": int(np.sum((batch_preds == 3) | (batch_preds == 4))),
+                }
+
+                pdf_bytes = create_clinical_pdf(
+                    metrics_dict=metrics_payload,
+                    anomalies_list=abnormal_idxs,
+                    hrv_metrics=hrv_metrics,
+                    st_data=st_data,
+                    fig_anomaly=fig
+                )
+
+                st.download_button(
+                    label="📥 Download Clinical Audit Report (PDF)",
+                    data=bytes(pdf_bytes),
+                    file_name=f"ECG_Clinical_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
             else:
                 st.warning("No complete heartbeats could be segmented from the provided signal duration.")
+
 
 if __name__ == '__main__':
     main()
