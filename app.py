@@ -131,13 +131,14 @@ def main():
     available_indices = np.where(y_test == selected_class_label)[0]
     st.sidebar.info(f"Available samples in DS2 for this class: **{len(available_indices)}**")
     
-    # Ensure slider is only rendered if more than 1 sample is available
+    # Dynamic key prevents duplicate element IDs; safe conditional prevents min==max error
     if len(available_indices) > 1:
         sample_sub_idx = st.sidebar.slider(
-            "Select Sample Index:", 
-            0, 
-            len(available_indices) - 1, 
-            0
+            "Select Sample Index:",
+            min_value=0,
+            max_value=len(available_indices) - 1,
+            value=0,
+            key=f"sample_slider_{selected_cat}"
         )
     else:
         sample_sub_idx = 0
