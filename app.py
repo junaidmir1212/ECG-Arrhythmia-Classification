@@ -138,7 +138,7 @@ def main():
             min_value=0,
             max_value=len(available_indices) - 1,
             value=0,
-            key=f"sample_slider_{beat_class}"
+            key=f"sample_slider_{selected_class_label}"
         )
     else:
         sample_sub_idx = 0
