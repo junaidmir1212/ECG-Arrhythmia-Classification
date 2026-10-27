@@ -138,12 +138,11 @@ def main():
             min_value=0,
             max_value=len(available_indices) - 1,
             value=0,
-            key=f"sample_slider_{selected_cat}"
+            key=f"sample_slider_{beat_class}"
         )
     else:
         sample_sub_idx = 0
         
-    sample_sub_idx = st.sidebar.slider("Select Sample Index:", 0, len(available_indices) - 1, 0)
     beat_idx = available_indices[sample_sub_idx]
 
     # Inference
