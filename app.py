@@ -6,9 +6,9 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from scipy.signal import butter, filtfilt
 from model import ECGArrhythmiaClassifier
 from config import CLASS_NAMES
-from pan_tompkins import PanTompkinsDetector
 
 st.set_page_config(
     page_title="ECG Arrhythmia AI Diagnostic Studio",
@@ -16,7 +16,42 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. Model & Data Caching ---
+# --- 1. Embedded Pan-Tompkins Autonomous QRS Detector ---
+class PanTompkinsDetector:
+    def __init__(self, fs=360):
+        self.fs = fs
+
+    def bandpass_filter(self, signal, lowcut=5.0, highcut=15.0):
+        nyquist = 0.5 * self.fs
+        low = max(lowcut / nyquist, 0.001)
+        high = min(highcut / nyquist, 0.999)
+        b, a = butter(1, [low, high], btype='band')
+        return filtfilt(b, a, signal)
+
+    def detect_peaks(self, signal):
+        filtered = self.bandpass_filter(signal)
+        diff = np.diff(filtered)
+        squared = diff ** 2
+        window_size = int(0.15 * self.fs)
+        integrated = np.convolve(squared, np.ones(window_size) / window_size, mode='same')
+        
+        threshold = np.mean(integrated) + 1.2 * np.std(integrated)
+        min_distance = int(0.25 * self.fs)
+        peaks = []
+        last_peak = -min_distance
+
+        for i in range(1, len(integrated) - 1):
+            if integrated[i] > threshold and integrated[i] > integrated[i-1] and integrated[i] > integrated[i+1]:
+                if i - last_peak > min_distance:
+                    search_start = max(0, i - int(0.08 * self.fs))
+                    search_end = min(len(filtered), i + int(0.08 * self.fs))
+                    r_peak = search_start + np.argmax(filtered[search_start:search_end])
+                    peaks.append(r_peak)
+                    last_peak = i
+        return np.array(peaks, dtype=int)
+
+
+# --- 2. Model & Data Caching ---
 @st.cache_resource
 def load_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -39,37 +74,32 @@ def load_test_data():
     elif os.path.exists('sample_X_test.npy') and os.path.exists('sample_y_test.npy'):
         return np.load('sample_X_test.npy'), np.load('sample_y_test.npy')
     
-    import wfdb
-    from scipy.signal import butter, filtfilt
-    
-    rec_path = 'mitdb/100'
-    if not os.path.exists(f"{rec_path}.dat"):
-        os.makedirs('mitdb', exist_ok=True)
-        wfdb.dl_files('mitdb', 'mitdb', ['100.dat', '100.hea', '100.atr'])
-        
-    record = wfdb.rdrecord(rec_path, channels=[0])
-    ann = wfdb.rdann(rec_path, 'atr')
-    raw_signal = record.p_signal[:, 0]
-    
-    nyq = 0.5 * 360
-    b, a = butter(3, [0.5 / nyq, 45.0 / nyq], btype='band')
-    filtered = filtfilt(b, a, raw_signal)
-    
+    # In-memory balanced fallback across all 5 classes
+    t = np.linspace(-1, 1, 256)
     beats, labels = [], []
-    for r_peak, sym in zip(ann.sample[:300], ann.symbol[:300]):
-        start, end = r_peak - 128, r_peak + 128
-        if start >= 0 and end < len(filtered):
-            beat = filtered[start:end]
-            std = np.std(beat)
-            beat = (beat - np.mean(beat)) / (std if std > 1e-6 else 1e-6)
-            beats.append(beat)
-            labels.append(2 if sym in ['V', 'E'] else 0)
+    for cls_idx in range(5):
+        for _ in range(20):
+            jitter = np.random.normal(0, 0.02, 256)
+            if cls_idx == 0:
+                b = np.exp(-150 * t**2) - 0.25 * np.exp(-30 * (t - 0.35)**2) + 0.15 * np.exp(-50 * (t + 0.35)**2)
+            elif cls_idx == 1:
+                b = np.exp(-300 * (t + 0.1)**2) - 0.2 * np.exp(-40 * (t - 0.25)**2)
+            elif cls_idx == 2:
+                b = -np.exp(-35 * t**2) + 0.3 * np.exp(-20 * (t - 0.4)**2)
+            elif cls_idx == 3:
+                b = 0.5 * np.exp(-80 * t**2) - 0.5 * np.exp(-40 * (t + 0.1)**2)
+            else:
+                b = np.zeros(256)
+                b[120] = 1.2
+            sig = b + jitter
+            sig = (sig - np.mean(sig)) / (np.std(sig) + 1e-6)
+            beats.append(sig)
+            labels.append(cls_idx)
             
-    X = np.expand_dims(np.array(beats, dtype=np.float32), axis=1)
-    y = np.array(labels, dtype=np.int64)
-    return X, y
+    return np.expand_dims(np.array(beats, dtype=np.float32), 1), np.array(labels, dtype=np.int64)
 
-# --- 2. 1D Grad-CAM Engine ---
+
+# --- 3. 1D Grad-CAM Engine ---
 class GradCAM1D:
     def __init__(self, model, target_layer):
         self.model = model
@@ -102,12 +132,13 @@ class GradCAM1D:
         )
         return cam_up.squeeze().detach().cpu().numpy()
 
-# --- 3. UI Application ---
+
+# --- 4. Main Application ---
 def main():
     st.title("🫀 Real-Time ECG Arrhythmia Diagnostics & Interpretability")
     st.markdown(
         "Interactive clinical interface adhering to the **AAMI EC57 inter-patient evaluation standard**. "
-        "Inspect pre-segmented test cohort beats or upload raw, continuous patient ECGs for automated multi-beat triage."
+        "Inspect pre-segmented test cohort beats or upload raw continuous patient ECGs for automated multi-beat triage."
     )
 
     try:
@@ -233,7 +264,6 @@ def main():
             key="continuous_ecg_uploader"
         )
 
-        # Allow loading record 100 as an instant demo if no file is uploaded
         demo_btn = st.button("Load Demo Continuous Patient Trace (Record 100, 10s)")
         
         raw_signal = None
