@@ -6,3 +6,4 @@ mitdb/
 *.pth
 *.png
 .DS_Store
+!gradcam_output.png
