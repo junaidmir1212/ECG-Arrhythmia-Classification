@@ -2,8 +2,13 @@ venv/
 __pycache__/
 *.pyc
 mitdb/
-*.npy
-*.pth
-*.png
+X_train.npy
+y_train.npy
+X_test.npy
+y_test.npy
 .DS_Store
+!ecg_arrhythmia_best.pth
+!sample_X_test.npy
+!sample_y_test.npy
 !gradcam_output.png
+!advanced_xai_counterfactual.png
