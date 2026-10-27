@@ -16,19 +16,60 @@ st.set_page_config(
 # --- 1. Model & Data Caching ---
 @st.cache_resource
 def load_model():
+    import os
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = ECGArrhythmiaClassifier(num_classes=5)
-    model.load_state_dict(torch.load('ecg_arrhythmia_best.pth', map_location=device))
+    model_path = 'ecg_arrhythmia_best.pth'
+    
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    else:
+        st.sidebar.warning("⚡ Running with initialized demonstration weights (ecg_arrhythmia_best.pth not found locally).")
+        
     model.to(device)
     model.eval()
     return model, device
 
 @st.cache_data
 def load_test_data():
-    X_test = np.load('X_test.npy')
-    y_test = np.load('y_test.npy')
-    return X_test, y_test
-
+    import os
+    if os.path.exists('X_test.npy') and os.path.exists('y_test.npy'):
+        return np.load('X_test.npy'), np.load('y_test.npy')
+    elif os.path.exists('sample_X_test.npy') and os.path.exists('sample_y_test.npy'):
+        return np.load('sample_X_test.npy'), np.load('sample_y_test.npy')
+    
+    # Extract real heartbeats directly from patient record 100
+    import wfdb
+    from scipy.signal import butter, filtfilt
+    
+    rec_path = 'mitdb/100'
+    if not os.path.exists(f"{rec_path}.dat"):
+        os.makedirs('mitdb', exist_ok=True)
+        wfdb.dl_files('mitdb', 'mitdb', ['100.dat', '100.hea', '100.atr'])
+        
+    record = wfdb.rdrecord(rec_path, channels=[0])
+    ann = wfdb.rdann(rec_path, 'atr')
+    raw_signal = record.p_signal[:, 0]
+    
+    # 0.5 - 45 Hz Butterworth filter
+    nyq = 0.5 * 360
+    b, a = butter(3, [0.5 / nyq, 45.0 / nyq], btype='band')
+    filtered = filtfilt(b, a, raw_signal)
+    
+    beats, labels = [], []
+    for r_peak, sym in zip(ann.sample[:300], ann.symbol[:300]):
+        start, end = r_peak - 128, r_peak + 128
+        if start >= 0 and end < len(filtered):
+            beat = filtered[start:end]
+            std = np.std(beat)
+            beat = (beat - np.mean(beat)) / (std if std > 1e-6 else 1e-6)
+            beats.append(beat)
+            # Patient 100 primarily has Normal (0) with occasional PVC / VEB (2)
+            labels.append(2 if sym in ['V', 'E'] else 0)
+            
+    X = np.expand_dims(np.array(beats, dtype=np.float32), axis=1)
+    y = np.array(labels, dtype=np.int64)
+    return X, y
 # --- 2. 1D Grad-CAM Engine ---
 class GradCAM1D:
     def __init__(self, model, target_layer):
