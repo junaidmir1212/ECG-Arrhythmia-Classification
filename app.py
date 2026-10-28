@@ -67,12 +67,30 @@ def compute_hrv_metrics(r_peaks, fs=360):
     if len(r_peaks) < 2:
         return None, None, None
     
+    r_peaks = np.array(r_peaks, dtype=np.float32)
+    
+    # R-R intervals in milliseconds
     rr_intervals_ms = np.diff(r_peaks) / fs * 1000.0
     rr_times_sec = r_peaks[1:] / fs
 
-    mean_rr = np.mean(rr_intervals_ms)
-    mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 0
-    sdnn = np.std(rr_intervals_ms, ddof=1) if len(rr_intervals_ms) > 1 else 0.0
+    mean_rr = float(np.mean(rr_intervals_ms))
+    mean_hr = float(60000.0 / mean_rr) if mean_rr > 0 else 0.0
+    sdnn = float(np.std(rr_intervals_ms, ddof=1)) if len(rr_intervals_ms) > 1 else 0.0
+    
+    # Successive differences
+    successive_diffs = np.diff(rr_intervals_ms)
+    rmssd = float(np.sqrt(np.mean(successive_diffs ** 2))) if len(successive_diffs) > 0 else 0.0
+    nn50 = np.sum(np.abs(successive_diffs) > 50)
+    pnn50 = float(nn50 / len(successive_diffs) * 100.0) if len(successive_diffs) > 0 else 0.0
+
+    metrics = {
+        "mean_hr": mean_hr,
+        "mean_rr": mean_rr,
+        "sdnn": sdnn,
+        "rmssd": rmssd,
+        "pnn50": pnn50
+    }
+    return metrics, rr_times_sec, rr_intervals_ms
     
     successive_diffs = np.diff(rr_intervals_ms)
     rmssd = np.sqrt(np.mean(successive_diffs ** 2)) if len(successive_diffs) > 0 else 0.0
