@@ -50,3 +50,84 @@ Input ECG Beat (1 × 256 @ 360 Hz)
   ├── Flatten
   ├── Dropout (p=0.4)
   └── Linear (Hidden ──► 5 Logits) ──► Softmax Output
+
+  ### 2. 1D Gradient-Weighted Class Activation Mapping (Grad-CAM)
+Class-discriminative localization maps $L_{\text{Grad-CAM}}^c$ are computed by taking the gradient of class score $y^c$ with respect to feature activation maps $A^k$ of the final convolutional layer:
+
+$$\alpha_k^c = \frac{1}{L} \sum_{i=1}^L \frac{\partial y^c}{\partial A_i^k}$$
+
+$$L_{\text{Grad-CAM}}^c = \text{ReLU}\left( \sum_k \alpha_k^c A^k \right)$$
+
+The resulting 1D attribution map is linearly interpolated to match the original 256-sample window and mapped via the `inferno` colormap.
+
+### 3. Autonomic HRV Equations
+* **SDNN (Standard Deviation of NN Intervals):**
+  $$\text{SDNN} = \sqrt{\frac{1}{N-1} \sum_{i=1}^N (RR_i - \overline{RR})^2}$$
+* **RMSSD (Root Mean Square of Successive Differences):**
+  $$\text{RMSSD} = \sqrt{\frac{1}{N-1} \sum_{i=1}^{N-1} (RR_{i+1} - RR_i)^2}$$
+
+---
+
+## 🗂️ Repository Structure
+
+```text
+ecg-arrhythmia-classification/
+├── app.py                         # Unified Streamlit Clinical Diagnostic Studio
+├── model.py                       # 1D PyTorch Arrhythmia Classifier Architecture
+├── config.py                      # AAMI EC57 class mappings & clinical constants
+├── pan_tompkins.py                # Standalone Pan-Tompkins QRS detection engine
+├── generate_sample_patient_ecg.py # Synthetic continuous ECG trace generator (PVC/SVPB)
+├── requirements.txt               # Production dependencies
+├── ecg_arrhythmia_best.pth        # Trained PyTorch model checkpoint
+├── X_test.npy / y_test.npy        # AAMI DS2 inter-patient test cohort data
+└── README.md                      # Clinical & system documentation
+
+## 🚀 Quickstart Guide
+
+### 1. Clone & Set Up Environment
+
+```bash
+git clone [https://github.com/junaidmir1212/ecg-arrhythmia-classification.git](https://github.com/junaidmir1212/ecg-arrhythmia-classification.git)
+cd ecg-arrhythmia-classification
+
+# Create and activate virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+## 📊 AAMI EC57 Inter-Patient Benchmark
+
+Model performance is evaluated against the MIT-BIH Arrhythmia Database strictly partitioned according to the **de Chazal et al. (2004)** inter-patient protocol to prevent data leakage:
+
+| Class Identifier | Clinical Description | Train/Val ($DS1$) | Test ($DS2$) | Primary Feature Focus |
+| :---: | :--- | :---: | :---: | :--- |
+| **N** | Normal Sinus / Bundle Branches | 45,844 | 44,259 | Baseline PR, QRS, ST-T continuity |
+| **S** | Supraventricular Ectopic (SVPB) | 943 | 1,836 | Premature P-wave / compensatory interval |
+| **V** | Ventricular Ectopic (PVC) | 3,788 | 3,220 | Broad, bizarre QRS / inverted T-wave |
+| **F** | Fusion (Ventricular + Normal) | 414 | 388 | Hybrid morphology |
+| **Q** | Paced / Unclassifiable | 8 | 7 | Sharp stimulus pacing artifacts |
+
+---
+
+## 📑 Clinical Audit Report Sample
+
+The automated PDF report outputs:
+1. **Patient Recording Summary**: Total beats, sampling frequency, recording duration, mean HR.
+2. **Autonomic HRV Profile**: SDNN, RMSSD, and pNN50 metrics.
+3. **Ischemia & Infarction Assessment**: Measured $J+60\text{ ms}$ voltage shifts relative to the $PR$ baseline.
+4. **AAMI EC57 Distribution**: Itemized count and clinical prevalence percentages.
+5. **Deep Feature Attribution**: Embedded high-resolution 1D Grad-CAM plot highlighting aberrant intervals.
+
+---
+
+## ⚖️ Clinical Disclaimer
+
+> **Notice:** This software is an experimental, edge-optimized diagnostic decision-support model developed for biomedical research and academic auditing under the AAMI EC57 benchmark. It is not an FDA-cleared diagnostic medical device and should not replace primary evaluation by a qualified medical practitioner or certified electrophysiologist.
+
+---
+
+## 📜 License
+
+Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
