@@ -50,8 +50,8 @@ Input ECG Beat (1 × 256 @ 360 Hz)
   ├── Flatten
   ├── Dropout (p=0.4)
   └── Linear (Hidden ──► 5 Logits) ──► Softmax Output
-
-  ### 2. 1D Gradient-Weighted Class Activation Mapping (Grad-CAM)
+```
+### 2. 1D Gradient-Weighted Class Activation Mapping (Grad-CAM)
 Class-discriminative localization maps $L_{\text{Grad-CAM}}^c$ are computed by taking the gradient of class score $y^c$ with respect to feature activation maps $A^k$ of the final convolutional layer:
 
 $$\alpha_k^c = \frac{1}{L} \sum_{i=1}^L \frac{\partial y^c}{\partial A_i^k}$$
@@ -81,7 +81,7 @@ ecg-arrhythmia-classification/
 ├── ecg_arrhythmia_best.pth        # Trained PyTorch model checkpoint
 ├── X_test.npy / y_test.npy        # AAMI DS2 inter-patient test cohort data
 └── README.md                      # Clinical & system documentation
-
+```
 ## 🚀 Quickstart Guide
 
 ### 1. Clone & Set Up Environment
@@ -89,7 +89,7 @@ ecg-arrhythmia-classification/
 ```bash
 git clone [https://github.com/junaidmir1212/ecg-arrhythmia-classification.git](https://github.com/junaidmir1212/ecg-arrhythmia-classification.git)
 cd ecg-arrhythmia-classification
-
+```
 # Create and activate virtual environment
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
