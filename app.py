@@ -150,6 +150,77 @@ def measure_st_deviation(beat_raw, r_idx_local=128, fs=360):
         "color": color
     }
 
+# =====================================================================
+# 12-Lead ECG Processing & Multi-Lead Ischemia Engines
+# =====================================================================
+STANDARD_12_LEADS = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
+
+ANATOMICAL_LEAD_GROUPS = {
+    "Inferior Wall (RCA / LCx)": ['II', 'III', 'aVF'],
+    "Septal Wall (LAD)": ['V1', 'V2'],
+    "Anterior Wall (LAD)": ['V3', 'V4'],
+    "Lateral Wall (LCx / Diagonal)": ['I', 'aVL', 'V5', 'V6'],
+    "Reciprocal / Cavitary": ['aVR']
+}
+
+def parse_ecg_file(uploaded_file):
+    """
+    Parses CSV, TXT, or NPY files into a structured dictionary:
+    Returns:
+        dict: {
+            'leads': dict mapping lead_name -> 1D numpy array,
+            'lead_names': list of available leads,
+            'is_12_lead': bool
+        }
+    """
+    if uploaded_file.name.endswith(".npy"):
+        data = np.load(uploaded_file)
+        if data.ndim == 1:
+            return {'leads': {'Lead II': data.astype(np.float32)}, 'lead_names': ['Lead II'], 'is_12_lead': False}
+        elif data.ndim == 2:
+            if data.shape[0] == 12:
+                leads_dict = {STANDARD_12_LEADS[i]: data[i].astype(np.float32) for i in range(12)}
+                return {'leads': leads_dict, 'lead_names': STANDARD_12_LEADS, 'is_12_lead': True}
+            elif data.shape[1] == 12:
+                leads_dict = {STANDARD_12_LEADS[i]: data[:, i].astype(np.float32) for i in range(12)}
+                return {'leads': leads_dict, 'lead_names': STANDARD_12_LEADS, 'is_12_lead': True}
+            else:
+                return {'leads': {'Lead 0': data[:, 0].astype(np.float32)}, 'lead_names': ['Lead 0'], 'is_12_lead': False}
+
+    # CSV / TXT Parsing
+    df = pd.read_csv(uploaded_file)
+    cols = [str(c).strip() for c in df.columns]
+    matched_leads = [lead for lead in STANDARD_12_LEADS if lead in cols]
+    
+    if len(matched_leads) >= 12:
+        leads_dict = {lead: df[lead].values.astype(np.float32) for lead in STANDARD_12_LEADS}
+        return {'leads': leads_dict, 'lead_names': STANDARD_12_LEADS, 'is_12_lead': True}
+    elif df.shape[1] == 12:
+        leads_dict = {STANDARD_12_LEADS[i]: df.iloc[:, i].values.astype(np.float32) for i in range(12)}
+        return {'leads': leads_dict, 'lead_names': STANDARD_12_LEADS, 'is_12_lead': True}
+    else:
+        return {'leads': {'Lead II': df.iloc[:, 0].values.astype(np.float32)}, 'lead_names': ['Lead II'], 'is_12_lead': False}
+
+
+def localize_12lead_ischemia(leads_dict, r_peak_idx, fs=360):
+    st_summary = {}
+    contiguous_alerts = []
+
+    for lead_name in STANDARD_12_LEADS:
+        if lead_name not in leads_dict:
+            continue
+        sig = leads_dict[lead_name]
+        if r_peak_idx - 128 >= 0 and r_peak_idx + 128 < len(sig):
+            beat = sig[r_peak_idx - 128 : r_peak_idx + 128]
+            st_res = measure_st_deviation(beat, r_idx_local=128, fs=fs)
+            st_summary[lead_name] = st_res
+
+    for territory, group in ANATOMICAL_LEAD_GROUPS.items():
+        elevated_in_group = [l for l in group if l in st_summary and st_summary[l]["st_deviation_mv"] >= 0.10]
+        if len(elevated_in_group) >= 2:
+            contiguous_alerts.append(f"{territory} (Elevated in: {', '.join(elevated_in_group)})")
+
+    return st_summary, contiguous_alerts
 
 # =====================================================================
 # 3. Clinical PDF Report Generator
@@ -501,14 +572,16 @@ def main():
         demo_btn = st.button("Load Demo Continuous Patient Trace (Record 100, 10s)")
         
         raw_signal = None
+        leads_dict = {}
+        is_12_lead = False
         fs = 360
 
         if uploaded_file is not None:
-            if uploaded_file.name.endswith(".npy"):
-                raw_signal = np.load(uploaded_file).flatten()
-            else:
-                df = pd.read_csv(uploaded_file, header=None)
-                raw_signal = df.iloc[:, 0].values.astype(np.float32)
+            parsed = parse_ecg_file(uploaded_file)
+            leads_dict = parsed['leads']
+            is_12_lead = parsed['is_12_lead']
+            primary_lead = 'II' if 'II' in leads_dict else parsed['lead_names'][0]
+            raw_signal = leads_dict[primary_lead]
         elif demo_btn:
             import wfdb
             rec_path = 'mitdb/100'
@@ -517,6 +590,8 @@ def main():
                 wfdb.dl_files('mitdb', 'mitdb', ['100.dat', '100.hea', '100.atr'])
             rec = wfdb.rdrecord(rec_path, sampfrom=0, sampto=3600, channels=[0])
             raw_signal = rec.p_signal[:, 0].astype(np.float32)
+            leads_dict = {'Lead II': raw_signal}
+            is_12_lead = False
 
         if raw_signal is not None:
             duration_sec = len(raw_signal) / fs
@@ -721,6 +796,45 @@ def main():
                 plt.tight_layout()
                 st.pyplot(fig_st)
                 plt.close(fig_st)
+
+# --- 12-Lead Standard Clinical ECG Montage Grid ---
+                if is_12_lead:
+                    st.write("---")
+                    st.subheader("📋 12-Lead Diagnostic Electrocardiogram Grid")
+                    
+                    st_12lead_res, territory_alerts = localize_12lead_ischemia(
+                        leads_dict, valid_peaks[inspect_idx], fs=fs
+                    )
+                    
+                    if len(territory_alerts) > 0:
+                        st.error(f"🚨 **Contiguous STEMI Pattern Detected:** {', '.join(territory_alerts)}")
+                    else:
+                        st.info("No contiguous ST-elevation criteria met across standard anatomical lead groups.")
+
+                    col_leads = [
+                        ['I', 'aVR', 'V1', 'V4'],
+                        ['II', 'aVL', 'V2', 'V5'],
+                        ['III', 'aVF', 'V3', 'V6']
+                    ]
+                    grid_cols = st.columns(3)
+
+                    for c_idx, group in enumerate(col_leads):
+                        with grid_cols[c_idx]:
+                            for l_name in group:
+                                if l_name in leads_dict and l_name in st_12lead_res:
+                                    fig_lead, ax_l = plt.subplots(figsize=(4, 1.2))
+                                    beat_l = leads_dict[l_name][valid_peaks[inspect_idx]-128 : valid_peaks[inspect_idx]+128]
+                                    st_shift = st_12lead_res[l_name]['st_deviation_mv']
+                                    
+                                    lead_color = '#e74c3c' if st_shift >= 0.10 else ('#e67e22' if st_shift <= -0.05 else '#2c3e50')
+                                    ax_l.plot(beat_l, color=lead_color, lw=1.2)
+                                    ax_l.set_title(f"Lead {l_name} (ST: {st_shift:+.2f} mV)", fontsize=8, pad=2)
+                                    ax_l.set_xticks([])
+                                    ax_l.set_yticks([])
+                                    ax_l.grid(True, linestyle=':', alpha=0.3)
+                                    st.pyplot(fig_lead)
+                                    plt.close(fig_lead)
+                                    
 
                 # --- PDF Generation Action ---
                 st.write("---")
