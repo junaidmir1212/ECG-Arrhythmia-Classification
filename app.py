@@ -243,12 +243,13 @@ class ClinicalECGReport(FPDF):
         self.cell(0, 10, f"ECG Arrhythmia AI Diagnostic Studio | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Page {self.page_no()}", align="C")
 
 
-def create_clinical_pdf(metrics_dict, anomalies_list, hrv_metrics=None, st_data=None, fig_anomaly=None):
+def create_clinical_pdf(metrics_dict, anomalies_list, hrv_metrics=None, st_data=None, fig_anomaly=None, 
+                        is_12_lead=False, territory_alerts=None, fig_12lead=None):
     pdf = ClinicalECGReport(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     
-    # Study Metadata
+    # 1. Study Metadata
     pdf.set_font("Helvetica", "B", 11)
     pdf.set_text_color(44, 62, 80)
     pdf.cell(0, 7, "1. Patient Trace Assessment Summary", new_x="LMARGIN", new_y="NEXT")
@@ -261,11 +262,36 @@ def create_clinical_pdf(metrics_dict, anomalies_list, hrv_metrics=None, st_data=
     pdf.cell(95, 6, f"Mean Heart Rate: {metrics_dict['mean_hr']:.0f} bpm", border=1, new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
-    # Autonomic Tone & HRV
+    # 2. 12-Lead Infarction Territory Localization (if present)
+    if is_12_lead:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(44, 62, 80)
+        pdf.cell(0, 7, "2. 12-Lead Contiguous Ischemia & Infarct Localization", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_font("Helvetica", "", 9)
+        if territory_alerts and len(territory_alerts) > 0:
+            pdf.set_text_color(192, 57, 43)  # Alert Red
+            pdf.multi_cell(0, 5, f"CRITICAL CRITERIA MET: Contiguous ST elevation identified in: {', '.join(territory_alerts)}.")
+        else:
+            pdf.set_text_color(39, 174, 96)  # Benign Green
+            pdf.multi_cell(0, 5, "No contiguous anatomical ST-segment elevation detected across standard territories.")
+        
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+        # Embed 12-Lead Montage Grid figure
+        if fig_12lead is not None:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_12l:
+                fig_12lead.savefig(tmp_12l.name, dpi=200, bbox_inches="tight")
+                pdf.image(tmp_12l.name, x=15, w=180)
+            pdf.ln(3)
+
+    # 3. Autonomic Tone & HRV Biomarkers
     if hrv_metrics is not None:
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_text_color(44, 62, 80)
-        pdf.cell(0, 7, "2. Autonomic Assessment & HRV Biomarkers", new_x="LMARGIN", new_y="NEXT")
+        sec_num = "3" if is_12_lead else "2"
+        pdf.cell(0, 7, f"{sec_num}. Autonomic Assessment & HRV Biomarkers", new_x="LMARGIN", new_y="NEXT")
 
         pdf.set_font("Helvetica", "B", 9)
         pdf.set_fill_color(240, 243, 244)
@@ -286,62 +312,26 @@ def create_clinical_pdf(metrics_dict, anomalies_list, hrv_metrics=None, st_data=
             pdf.cell(100, 6, indication, border=1, new_x="LMARGIN", new_y="NEXT")
         pdf.ln(3)
 
-    # Ischemia / ST Deviation
-    if st_data is not None:
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(44, 62, 80)
-        pdf.cell(0, 7, "3. Ischemic Injury Assessment (ST-Segment Deviation)", new_x="LMARGIN", new_y="NEXT")
+    # 4. Single-Beat Morphological Assessment & Attribution
+    sec_num = "4" if is_12_lead else "3"
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(44, 62, 80)
+    pdf.cell(0, 7, f"{sec_num}. Morphological & 1D Grad-CAM Attribution", new_x="LMARGIN", new_y="NEXT")
 
+    if st_data is not None:
         pdf.set_font("Helvetica", "", 9)
         pdf.cell(60, 6, f"Measured ST Shift: {st_data['st_deviation_mv']:+.2f} mV", border=1)
         pdf.cell(50, 6, f"Status: {st_data['severity']}", border=1)
         pdf.cell(80, 6, f"Interpretation: {st_data['diagnosis']}", border=1, new_x="LMARGIN", new_y="NEXT")
         pdf.ln(3)
 
-    # AAMI EC57 Beat Classification Distribution
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.set_text_color(44, 62, 80)
-    pdf.cell(0, 7, "4. AAMI EC57 Rhythm Triage Counts", new_x="LMARGIN", new_y="NEXT")
-    
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.set_fill_color(240, 243, 244)
-    pdf.cell(60, 6, "Class Category", border=1, fill=True)
-    pdf.cell(35, 6, "Count", border=1, fill=True)
-    pdf.cell(35, 6, "Prevalence (%)", border=1, fill=True)
-    pdf.cell(60, 6, "Clinical Severity", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
-
-    pdf.set_font("Helvetica", "", 9)
-    classes_info = [
-        ("N (Normal Sinus)", metrics_dict['n_count'], "Baseline Conduction"),
-        ("V (Ventricular Ectopic / PVC)", metrics_dict['v_count'], "High Priority (Malignant Potential)"),
-        ("S (Supraventricular Ectopic)", metrics_dict['s_count'], "Moderate Priority"),
-        ("F / Q (Fusion / Unclassifiable)", metrics_dict['fq_count'], "Artifact / Complex Conduction")
-    ]
-    total_b = max(metrics_dict['total_beats'], 1)
-    for name, cnt, sev in classes_info:
-        pct = (cnt / total_b) * 100
-        pdf.cell(60, 6, name, border=1)
-        pdf.cell(35, 6, str(cnt), border=1)
-        pdf.cell(35, 6, f"{pct:.1f}%", border=1)
-        pdf.cell(60, 6, sev, border=1, new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-
-    # Anomaly Attribution & Grad-CAM Plot
     if fig_anomaly is not None:
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(44, 62, 80)
-        pdf.cell(0, 7, "5. Deep Feature Attribution (1D Grad-CAM Diagnostic Focus)", new_x="LMARGIN", new_y="NEXT")
-        
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(80, 80, 80)
-        pdf.multi_cell(0, 4, "The plot below illustrates salient activations driving the model's classification. Peaks highlighted in inferno colormap isolate aberrant intervals (e.g. widened QRS or ST deviations).")
-        pdf.ln(1)
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmpfile:
-            fig_anomaly.savefig(tmpfile.name, dpi=200, bbox_inches="tight")
-            pdf.image(tmpfile.name, x=15, w=180)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_fig:
+            fig_anomaly.savefig(tmp_fig.name, dpi=200, bbox_inches="tight")
+            pdf.image(tmp_fig.name, x=15, w=180)
         pdf.ln(3)
 
+    # 5. Regulatory Disclaimer
     pdf.set_font("Helvetica", "I", 8)
     pdf.set_text_color(130, 130, 130)
     pdf.multi_cell(0, 4, "Notice: This automated report is generated by an edge-optimized neural decision-support model under the AAMI EC57 inter-patient benchmark. It is intended to assist medical professionals by prioritizing anomalies and should not replace primary clinical evaluation by a certified electrophysiologist.")
@@ -798,6 +788,9 @@ def main():
                 plt.close(fig_st)
 
 # --- 12-Lead Standard Clinical ECG Montage Grid ---
+                fig_12lead_pdf = None
+                territory_alerts = []
+
                 if is_12_lead:
                     st.write("---")
                     st.subheader("📋 12-Lead Diagnostic Electrocardiogram Grid")
@@ -811,31 +804,33 @@ def main():
                     else:
                         st.info("No contiguous ST-elevation criteria met across standard anatomical lead groups.")
 
-                    col_leads = [
-                        ['I', 'aVR', 'V1', 'V4'],
-                        ['II', 'aVL', 'V2', 'V5'],
-                        ['III', 'aVF', 'V3', 'V6']
+                    # Create unified 4x3 figure for both on-screen display and PDF embedding
+                    fig_12lead_pdf, axes_grid = plt.subplots(4, 3, figsize=(11, 6), sharex=True)
+                    lead_layout = [
+                        ['I', 'aVR', 'V1'],
+                        ['II', 'aVL', 'V2'],
+                        ['III', 'aVF', 'V3'],
+                        ['V4', 'V5', 'V6']
                     ]
-                    grid_cols = st.columns(3)
 
-                    for c_idx, group in enumerate(col_leads):
-                        with grid_cols[c_idx]:
-                            for l_name in group:
-                                if l_name in leads_dict and l_name in st_12lead_res:
-                                    fig_lead, ax_l = plt.subplots(figsize=(4, 1.2))
-                                    beat_l = leads_dict[l_name][valid_peaks[inspect_idx]-128 : valid_peaks[inspect_idx]+128]
-                                    st_shift = st_12lead_res[l_name]['st_deviation_mv']
-                                    
-                                    lead_color = '#e74c3c' if st_shift >= 0.10 else ('#e67e22' if st_shift <= -0.05 else '#2c3e50')
-                                    ax_l.plot(beat_l, color=lead_color, lw=1.2)
-                                    ax_l.set_title(f"Lead {l_name} (ST: {st_shift:+.2f} mV)", fontsize=8, pad=2)
-                                    ax_l.set_xticks([])
-                                    ax_l.set_yticks([])
-                                    ax_l.grid(True, linestyle=':', alpha=0.3)
-                                    st.pyplot(fig_lead)
-                                    plt.close(fig_lead)
-                                    
+                    for r_idx in range(4):
+                        for c_idx in range(3):
+                            l_name = lead_layout[r_idx][c_idx]
+                            ax = axes_grid[r_idx, c_idx]
+                            if l_name in leads_dict and l_name in st_12lead_res:
+                                beat_l = leads_dict[l_name][valid_peaks[inspect_idx]-128 : valid_peaks[inspect_idx]+128]
+                                st_shift = st_12lead_res[l_name]['st_deviation_mv']
+                                lead_color = '#e74c3c' if st_shift >= 0.10 else ('#e67e22' if st_shift <= -0.05 else '#2c3e50')
+                                ax.plot(beat_l, color=lead_color, lw=1.2)
+                                ax.set_title(f"Lead {l_name} ({st_shift:+.2f} mV)", fontsize=8, pad=2)
+                                ax.grid(True, linestyle=':', alpha=0.3)
+                            ax.set_xticks([])
+                            ax.set_yticks([])
 
+                    plt.tight_layout()
+                    st.pyplot(fig_12lead_pdf)
+
+                    
                 # --- PDF Generation Action ---
                 st.write("---")
                 st.subheader("📄 Clinical Decision-Support Export")
@@ -858,7 +853,10 @@ def main():
                     anomalies_list=abnormal_idxs,
                     hrv_metrics=hrv_metrics,
                     st_data=st_data,
-                    fig_anomaly=fig
+                    fig_anomaly=fig,
+                    is_12_lead=is_12_lead,
+                    territory_alerts=territory_alerts,
+                    fig_12lead=fig_12lead_pdf
                 )
 
                 st.download_button(
